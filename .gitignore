@@ -1,0 +1,11 @@
+# Private intake/evidence, generated files, and local tuner settings
+.development/
+build/
+dist/
+__pycache__/
+*.pyc
+*.log
+*.ts
+*.ts.err
+*.ini
+*.so

@@ -1,0 +1,82 @@
+# siano-tsbuf (β版 / v0.1.0-beta.1)
+
+> **β版です。** PX-Q1UD / PX-S1UD（Siano 系 USB チューナー）を **Ubuntu などの Linux** で使うときの、受信の安定化を狙った小さな受信バッファです。
+> 1台の録画機で検証しただけの段階です。環境によっては効果がない場合や不具合が出る場合があります。
+> 自己責任で使い、問題があれば Issue で知らせてください。
+
+## これは何か
+
+`dvbv5-zap` などのチューナーコマンドと、Mirakurun などの読み手の間に挟むラッパーです。
+
+```
+dvbv5-zap ──(pipe)──▶ siano-tsbuf [受信スレッド → 上限付きリング → 送信スレッド] ──▶ Mirakurun など
+```
+
+## 解決する問題
+
+Q1UD のドロップが多い原因の一つは、電波ではなく **ホスト側の取りこぼし** です（作者の環境で実測しました）。
+
+- `dvbv5-zap` は1本の処理で「DVR デバイスを読む → 標準出力へ書く」を繰り返します。
+- 読み手（Mirakurun / Node.js）が数秒止まると書き込みが詰まり、その間 DVR を読めなくなります。
+- カーネルの DVR バッファは約 6MB（地デジ約3秒分）しかなく、溢れると `buffer overrun` になって TS が塊で失われます。
+- そのため、**全 PID で同時にドロップ**が起きます（信号品質 C/N は良好なまま）。
+
+siano-tsbuf は別スレッドで常に吸い出し、読み手が止まった時間を上限付きのリングで吸収します。
+
+**直せないもの**: 電波・アンテナ・USB 給電・チップ自体の不具合によるドロップは直せません。たとえば Siano は 473MHz（13ch）を受信できない個体があります。
+
+## 使い方
+
+```sh
+make            # build/siano-tsbuf
+make test       # 合成データのみの回帰テスト（実機不要）
+sudo install -m 755 build/siano-tsbuf /usr/local/bin/
+
+siano-tsbuf [-b MiB] [-l logfile|-] [-t tag] -- dvbv5-zap -a 0 -c channels.conf -r -P -o - T24
+```
+
+| オプション | 意味 |
+|---|---|
+| `-b MiB` | リング容量。4〜256 の整数（既定 32 = 地デジ約15秒）。不正値は終了コード 2 |
+| `-l path` | ログ出力先（既定 `-` = 標準エラー） |
+| `-t tag` | ログのタグ（既定 `adapterN/チャンネル`） |
+| `SIANO_TSBUF_MB` / `SIANO_TSBUF_LOG` | 上記の環境変数版 |
+
+### Mirakurun の `tuners.yml` の例
+
+```yaml
+- name: PX-Q1UD #1
+  types: [GR]
+  command: siano-tsbuf -b 32 -l /var/log/siano-tsbuf.log -- dvbv5-zap -a 0 -c /usr/local/etc/mirakurun/dvbv5_channels_isdbt.conf -r -P -o - <channel>
+  decoder: ...
+```
+
+## 動作の約束
+
+- **バイト透過**: リングに収まる範囲では、入力をそのまま出力します。188 バイトに満たない末尾の端数も捨てません。
+- **上限付き**: リングが満杯になったときだけ、188 バイト単位で新しいデータを捨て、その量をログに記録します（`ring_drop_events` / `dropped_bytes`）。
+- **孤児を残さない**: ラッパーが SIGKILL されても子（`dvbv5-zap`）を道連れにし、frontend を掴んだままのプロセスを残しません。親が死んだ場合も終了します。
+- **終了コード**: 子の終了コードをそのまま返します。SIGTERM では 143、コマンドが見つからない場合は 127 です。
+- **終了ログ**: `exit rc=… in_bytes out_bytes peak_bytes dvr_overruns ring_drop_events dropped_bytes` を1行出力します。
+
+## 検証結果（作者環境）
+
+Ubuntu 24.04 / PX-Q1UD 相当 ×4（smsusb）/ Mirakurun + EDCB-Wine で検証しました。検証したのは本β版の**前身の試作版**で、リングの仕組みは同じです。
+
+| 試験 | 結果 |
+|---|---|
+| 単体比較（読み手を3秒ずつ止める、25秒） | 直結: **106 ドロップ / overrun 3回** → siano-tsbuf: **0 / 0** |
+| 実録画 3時間（tsdump、NHK総合、他3台も同時受信して負荷） | **1.12億パケット、ドロップ 0**、overrun 0 |
+| 同時刻・別チューナー（PX-Q3U4）の対照 | 1.34億パケット、ドロップ 1 |
+| 負荷用3ストリーム（各約1.16億パケット） | 0 / 0 / 3（3 は 30秒ごとに3秒止めた読み手側） |
+
+- 試験中に Mirakurun のイベントループは最大約 **20.8秒**止まりました。このバッファがなければ溢れる長さです。
+- **未検証**: 他のチューナー機種、他ディストリビューション、長期間（数日〜）の連続運用、本β版バイナリそのものによる長時間実録画。
+
+## 戻し方
+
+`tuners.yml` の `command` から `siano-tsbuf ... --` を外すだけです。設定は次にチャンネルを合わせたときから反映されます。
+
+## ライセンス
+
+MIT（[LICENSE](LICENSE)）
