@@ -24,6 +24,10 @@
  *      本プロセス自身も親 (dvb5-loop) が死んだら SIGTERM を受ける。
  *   3. root 実行時は nice -10 に上げ、高負荷時に読み出しが遅れないようにする (権限が無ければ何もしない)。
  *   4. dvbv5-zap の stderr を監視し "buffer overrun" やリング溢れをログに残す (可観測性)。
+ *   5. (0.2.0) TS の連続性カウンタ (CC) を検証し、このプロセスへ届く前に失われたパケット
+ *      (USB/ドライバ〜子プロセス側の取りこぼし) を ccgap 行と終了行の cc_gaps / cc_gap_pkts
+ *      に記録する。EDCB 等の下流が記録するドロップと突き合わせると、欠落が「本プロセス
+ *      より上流」か「下流」かを切り分けられる。
  *
  * 終了コード: 子の終了コードをそのまま返す (シグナル終了は 128+sig)。
  */
@@ -45,6 +49,7 @@
 #include <unistd.h>
 
 #define TS 188
+#define VERSION "0.2.0-beta.1"
 
 /* ---- 設定 ---- */
 static size_t ring_size = 32u << 20;
@@ -83,6 +88,51 @@ static void logmsg(const char *fmt, ...) {
 	pthread_mutex_unlock(&log_mu);
 }
 
+/* ---- CC (連続性カウンタ) 監視 ----
+ * payload 付きの各 PID について「前回 CC + 1」を検証し、食い違いを「このプロセスより上流で
+ * 失われたパケット」として数える (リング満杯による意図的な破棄 dropped_bytes とは別物)。
+ * ここで数える値は reader スレッドだけが更新し、終了行の読み出しは pthread_join 後なので
+ * 追加のロックは不要。 */
+#define PID_LIMIT 8192
+static uint8_t cc_last[PID_LIMIT]; /* PID ごとの直前 CC (payload 付きパケットのみ) */
+static uint8_t cc_seen[PID_LIMIT]; /* 1 = cc_last が有効 */
+static uint64_t cc_gaps, cc_gap_pkts, cc_logged;
+
+static void cc_check(const uint8_t *buf, size_t whole) {
+	for (size_t off = 0; off + TS <= whole; off += TS) {
+		const uint8_t *q = buf + off;
+		if (q[0] != 0x47) continue; /* 同期が崩れたら数えずに素通し (出力は不変) */
+		unsigned pid = ((q[1] & 0x1f) << 8) | q[2];
+		unsigned afc = (q[3] >> 4) & 3;
+		if (afc == 0 || afc == 2) continue; /* payload なし: CC は進まない */
+		unsigned cc = q[3] & 15;
+		if (cc_seen[pid] && cc != cc_last[pid]) {
+			unsigned expect = (cc_last[pid] + 1) & 15;
+			if (cc != expect) {
+				/* adaptation field の discontinuity_indicator は正規のジャンプ */
+				int disc = 0;
+				if (afc == 3 && q[4] > 0) disc = (q[5] & 0x80) != 0;
+				if (!disc) {
+					/* CC は 4bit。16 以上の塊欠落は 16 の剰余として現れる (仕様上の限界) */
+					unsigned lost = (cc - expect) & 15;
+					cc_gaps++;
+					cc_gap_pkts += lost;
+					/* 大量ドロップ時にログを溢れさせない: 先頭 200 行のみ、以降は件数だけ数える */
+					if (cc_logged < 200) {
+						cc_logged++;
+						logmsg("ccgap pid=0x%04X lost~%u (cc %u -> %u)", pid, lost, cc_last[pid], cc);
+					} else if (cc_logged == 200) {
+						cc_logged++;
+						logmsg("ccgap: further gap lines suppressed (totals still counted)");
+					}
+				}
+			}
+		}
+		cc_last[pid] = (uint8_t)cc;
+		cc_seen[pid] = 1;
+	}
+}
+
 static void on_sig(int s) {
 	got_sig = s;
 	if (child > 0) kill(child, SIGTERM);
@@ -104,6 +154,7 @@ static void *reader(void *arg) {
 		if (n == 0 && carry == 0) break;
 		size_t have = carry + (size_t)n;
 		size_t whole = n == 0 ? have : have - have % TS;
+		if (whole) cc_check(buf, whole); /* 入力側の欠落をここで数える (ロック不要) */
 		pthread_mutex_lock(&mu);
 		bytes_in += whole;
 		size_t freesp = ring_size - r_used;
@@ -230,7 +281,7 @@ int main(int argc, char **argv) {
 	const char *e;
 	if (argc == 2 && !strcmp(argv[1], "--help")) { usage(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "--version")) {
-		fprintf(stderr, "siano-tsbuf 0.1.0-beta.1\n");
+		fprintf(stderr, "siano-tsbuf %s\n", VERSION);
 		return 0;
 	}
 	if ((e = getenv("SIANO_TSBUF_MB")) && capacity(e) != 0) { usage(); return 2; }
@@ -289,7 +340,7 @@ int main(int argc, char **argv) {
 	close(pout[1]);
 	close(perr[1]);
 	t_start = time(NULL);
-	logmsg("start capacity_bytes=%zu cmd=%s", ring_size, argv[i]);
+	logmsg("start capacity_bytes=%zu version=%s cmd=%s", ring_size, VERSION, argv[i]);
 
 	pthread_t tr, tw, te;
 	pthread_create(&tr, NULL, reader, (void *)(intptr_t)pout[0]);
@@ -309,9 +360,10 @@ int main(int argc, char **argv) {
 
 	int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
 	if (got_sig) rc = 128 + got_sig;
-	logmsg("exit rc=%d secs=%ld in_bytes=%llu out_bytes=%llu peak_bytes=%zu dvr_overruns=%llu ring_drop_events=%llu dropped_bytes=%llu",
+	logmsg("exit rc=%d secs=%ld in_bytes=%llu out_bytes=%llu peak_bytes=%zu dvr_overruns=%llu ring_drop_events=%llu dropped_bytes=%llu cc_gaps=%llu cc_gap_pkts=%llu",
 	       rc, (long)(time(NULL) - t_start), (unsigned long long)bytes_in,
 	       (unsigned long long)bytes_out, peak_used, (unsigned long long)overruns,
-	       (unsigned long long)drop_events, (unsigned long long)bytes_dropped);
+	       (unsigned long long)drop_events, (unsigned long long)bytes_dropped,
+	       (unsigned long long)cc_gaps, (unsigned long long)cc_gap_pkts);
 	return rc;
 }

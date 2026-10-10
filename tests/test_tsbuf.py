@@ -60,7 +60,7 @@ class BufferTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b'')
                 self.assertIn(b'siano-tsbuf', result.stderr)
         result = subprocess.run([str(BINARY), '--version'], capture_output=True, timeout=3, check=False)
-        self.assertIn(b'0.1.0-beta.1', result.stderr)
+        self.assertIn(b'0.2.0-beta.1', result.stderr)
 
     def test_invalid_capacity_is_rejected(self) -> None:
         values = ('0', '3', '257', '-1', '+4', '4.0', '4x', ' 4', '', '9999999999999999999999')
@@ -99,6 +99,26 @@ class BufferTests(unittest.TestCase):
         result = self.run_buffer('--packets', '4096', '--chunks', '131,4096,8193')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, payload(4096, 0))
+        # 正常な入力では CC ギャップを 1 件も数えない (偽陽性が無いこと) の基準になる。
+        self.assertIn(b'cc_gaps=0', result.stderr)
+
+    def test_cc_gap_is_counted(self) -> None:
+        # 入力側の 3 パケットの CC ギャップを 1 件として数え、ログに PID と欠落数を残す。
+        result = self.run_buffer('--packets', '100', '--cc-mode', 'gap')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'cc_gaps=1', result.stderr)
+        self.assertIn(b'cc_gap_pkts=3', result.stderr)
+        self.assertIn(b'ccgap pid=0x0100 lost~3', result.stderr)
+        # 欠落は入力側の話であり、出力のバイト透過性は変わらない。
+        self.assertEqual(len(result.stdout), 100 * 188)
+
+    def test_cc_discontinuity_and_duplicate_are_not_gaps(self) -> None:
+        # discontinuity_indicator 付きジャンプと重複パケットは欠落として数えない。
+        for mode in ('disc', 'dup'):
+            with self.subTest(mode=mode):
+                result = self.run_buffer('--packets', '60', '--cc-mode', mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b'cc_gaps=0', result.stderr)
 
     def test_child_exit_code_passes_through(self) -> None:
         result = self.run_buffer('--packets', '32', '--exit-code', '23')
